@@ -1,282 +1,342 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-"""
-Code provided as is, without any warranty or whatsoever
-Made by Martin Vérot from the ENS de Lyon, France
-The inputs are defined after the "main program" comment line (diffusion coefficients, temperature, etc...)
-
-This code is under licence CC-BY-NC-SA
-It means that you cannot make profit from it, you need to mention the original author and if you reuse it, you must take the same licencing
-Otherwise, feel free to use it and enjoy the beauty of electrochemistry !
-
-
-##########################################################################
-Voltammetry for a rapid couple with the Nernst law as a boundary condition
-#########################################################################
-
-The numerical simulations come out of
-- Britz & Strutwolf : Digital simulation in Electrochemistry (2016) p96-98
-- Bard & Faulkner : Electrochemical Methods Fundamentals and Applications (2001) annex B
-- Girault : Électrochimie Physique et Analytique (2007) chapter 10 (the book exists in english "ANALYTICAL AND PHYSICAL ELECTROCHEMISTRY"
-
-I took variables with dimensions so as to stick as close as possible to the physical equations and keep them as straightforward as possible
-
-Britz and Strutwolf propose some programs as fortran codes, it is helpful to see how things are done by more seasoned programmers, however, the code is less readable as quite a lot of 'for' are involved where numpy slicing make it much shorter
-A program named ESP  (Electrochemical Simulations Package) also offers some simulations but the source code is not open and needs some compiling and it seems to be hard to run on recent computers
-
-
-The sampling either being to tight or sparse can lead to big numerical instabilities, you can change the numbers to make the computations more precise or faster, but if you see things going to infinity or zero, the sampling is probably at fault
-"""
-
-# Importation of libraries 
-import numpy as np
-import matplotlib.pyplot as plt
-import scipy.constants as constants
 import matplotlib.animation as animation
-import argparse
+import matplotlib.pyplot as plt
+import numpy as np
+import scipy.constants as constants
 
-# Functions used by the main program 
-def nextC(C,t,D,Cini,E,E0,n,T,deltat,deltax):
+F = constants.physical_constants['Faraday constant'][0]  # Faraday constant, 96485 C/mol
+R = constants.R  # Gas constant, 8.314 J/(mol·K)
+MOL_CONVERSION = 1000  # mol/L to mol/m³ conversion factor
+
+
+def laplacian(f, delta_x):
     """
-    Compute the concentration for the next time interval t+delta t from the concentration given at t,x
-    First the laplacian at step t-1 is taken and the partial derivative equation is propagated for time t as
-    C(t)=C(t-1)+D*deltat*lapC(t-1)
-        C array containing the concentration, first index position, second index : time, third index species
-        t indix of the time to consider
-        D array containing the diffusion coefficients of the species
-        deltat : time interval
-        deltax : space interval
+    Computes the Laplacian second derivative for given function
+
+    Parameters:
+    f : np.ndarray
+        Array containing the values of the function.
+    delta_x : float
+        Step size for spatial derivative.
+
+    Returns:
+    np.ndarray
+        Laplacian of the array.
     """
-    F = constants.physical_constants['Faraday constant'][0]
-    R = constants.R
-    newC = np.zeros_like(C[:,0,:])
-    #solving the diffusion equations for each species
-    for i in range(0,D.size):
-        lapC = laplacian(C[:,t-1,i],deltax) 
-        newC[:,i] = C[:,t-1,i] + D[i]*deltat*lapC
-        #Checking the concentrations at the end of the simulation
-        #if newC[-1,i] != Cini[i]:
-        #    print('the box considered is too short to be considered as a semi-infinite model')
-    #now solving the boundary conditions : Nernst equation at the electrodes and conservation of matter
-    #C_red/C_ox = exp (-(E-E0)*nF/RT) = theta (Nernst) -> C_red(0) - theta * C_ox(0) = 0
-    #D_red grad(C_red)+ D_ox grad (C_ox)_0 = 0 (conservation of matter) -> -D_red C_red(0) - D_ox C_ox(0) = -D_redC_red(1)-D_oxC_ox(1) (First order approximation for the gradient)
-    #In its matrix form AC=B 
-    theta=np.exp(-(E[t]-E0)*n*F/(R*T))
-    #print(alpha)
-    A = np.array([[1,-theta],[-D[0],-D[1]]])
-    B = np.array([0,-D[0]*C[1,t-1,0]-D[1]*C[1,t-1,1]])
-    sol = np.linalg.solve(A, B)
-    sol = sol.reshape(len(sol), 1)
-    newC[0] = np.transpose(sol)
-    #print(newC[0])
+    return np.gradient(np.gradient(f, delta_x, edge_order=2), delta_x, edge_order=2)
+
+
+def potential(Ei, Ef, nu, sampling_steps, nCycle):
+    """
+    Generate the potential profile as a function of time for cyclic simulations.
+
+    Parameters:
+        Ei (float): Initial potential (V)
+        Ef (float): Final potential (V)
+        nu (float): Scan rate (V/s)
+        sampling_steps (int): Number of steps for one forward scan
+        nCycle (float): Number of cycles, should be a multiple of 0.5
+
+    Returns:
+        Efull (list): Full potential profile for the entire scan
+    """
+    if nCycle % 0.5 != 0:
+        raise ValueError("The number of cycles should be a multiple of 0.5")
+
+    half_period_duration = abs(Ef - Ei) / nu
+    t = np.linspace(0, half_period_duration, sampling_steps, endpoint=False)
+    # Generate the forward and backward potential profiles based on Ei and Ef
+    if Ei < Ef:
+        Eforward = Ei + nu * t
+        Ebackward = Ef - nu * t
+    elif Ei > Ef:
+        Eforward = Ei - nu * t
+        Ebackward = Ef + nu * t
+    else:
+        raise ValueError("The starting and ending potential are the same.")
+    single_cycle = np.concatenate((Eforward, Ebackward))
+    num_full_cycles = int(nCycle)
+    Efull = np.tile(single_cycle, num_full_cycles)
+
+    # Handle the half-cycle if needed
+    if nCycle % 1 != 0:
+        Efull = np.concatenate((Efull, Eforward))  # Add forward scan for half-cycle
+        Efull = np.append(Efull, Ef)  # End at Ef for the half cycle
+    else:
+        Efull = np.append(Efull, Ei)  # End at Ei for a full cycle
+    return Efull
+
+
+def calculate_intensity(n, A, D, C, delta_x):
+    """
+    Calculates the intensity at each time step. (Faraday's Law of Electrolysis)
+
+    Parameters:
+    C : np.ndarray
+        Concentration array.
+    n : int
+        Number of electrons.
+    F : float
+        Faraday constant.
+    D : np.ndarray
+        Diffusion coefficients.
+    delta_x : float
+        Spatial step size.
+    """
+
+    gradCx = np.gradient(C[:, :, 0], delta_x, axis=0)
+
+    return n * F * A * D * gradCx[0, :]
+
+
+def solve_diffusion_equation(C, t, D, delta_t, delta_x):
+    """
+    Solve the diffusion equation (Fick's Second Law) for each species at time t.
+
+    The laplacian at step t-1 is taken and
+    the partial derivative equation is propagated for time t as C(t)=C(t-1)+D*delta_t*lapC(t-1)
+
+    Parameters:
+        C: np.ndarray
+            Array containing the concentration of species at all points and times.
+        t: int
+            Index of the current time step.
+        D: np.ndarray
+            Diffusion coefficients for the species.
+        delta_t: float
+            Time step size.
+        delta_x: float
+            Spatial step size.
+
+    Returns:
+        newC: np.ndarray
+            Updated concentration array after solving the diffusion equation.
+    """
+    newC = np.zeros_like(C[:, 0, :])
+
+    for i in range(D.size):
+        lapC = laplacian(C[:, t - 1, i], delta_x)
+        newC[:, i] = C[:, t - 1, i] + D[i] * delta_t * lapC
+
     return newC
 
-def intensity(C,x,deltax,deltat,n,A,D):
-    """
-    compute the intensity from the concentration profile
-    """
-    gradCx = np.gradient(C[:,:,0],deltax,axis=0)
-    
-    F = constants.physical_constants['Faraday constant'][0]
-    return n*F*A*D[0] * gradCx[0,:]#/deltax
 
-def laplacian(f,deltax):
+def apply_boundary_conditions(C, t, D, E, E0, n, T):
     """
-    Computes the laplacian second derivative with central formula
-        f : is the array containing the values of the function
-        deltax : sampling interval
-    """
-    out = np.zeros_like(f)
-    out[1:-1]=(f[2:]-2*f[1:-1]+f[0:-2])/deltax**2
-    out[0]=(f[2]-2*f[1]+f[0])/deltax**2
-    out[-1]=(f[-3]-2*f[-2]+f[-1])/deltax**2
-    return out
+    Apply the boundary conditions at the electrode surface using the Nernst equation.
 
-def lap(C,deltax,t,species):
+    At the electrode surface, the concentration of oxidized and reduced species is related by the Nernst Equation
+
+    C_red/C_ox = exp (-(E-E0)*nF/RT) = theta (Nernst Constant)
+    C_red(0) - theta * C_ox(0) = 0
+
+    D_red grad(C_red)+ D_ox grad (C_ox)_0 = 0 (conservation of matter)
+    -D_red C_red(0) - D_ox C_ox(0) = -D_redC_red(1)-D_oxC_ox(1) (First order approximation for the gradient)
+
+    Parameters:
+        C: np.ndarray
+            Array containing the concentration of species at all points and times.
+        t: int
+            Index of the current time step.
+        D: np.ndarray
+            Diffusion coefficients for the species.
+        E: np.ndarray
+            Array of voltages at each time step.
+        E0: float
+            Standard redox potential.
+        n: int
+            Number of electrons involved in the reaction.
+        T: float
+            Temperature in Kelvin.
+
+    Returns:
+        boundary_conditions: np.ndarray
+            Updated concentrations at the boundary.
     """
-    Compute the laplacian for species with index 'species' (0 : red, 1 : ox) at time t
-        C : array containing the concentrations
-        deltax : x sampling interval
-        t : indix of the time in the array
-        species : indix of the species for which the laplacian must be evaluated
-    """
-    return laplacian(C[:,t,species],deltax)
+    # Calculate the Nernst factor (theta)
+    theta = np.exp(-(E[t] - E0) * n * F / (R * T))
+
+    # Set up the matrix form AC = B
+    A = np.array([[1, -theta], [-D[0], -D[1]]])
+    B = np.array([0, -D[0] * C[1, t - 1, 0] - D[1] * C[1, t - 1, 1]])
+
+    # Solve the system of linear equations
+    sol = np.linalg.solve(A, B)
+
+    return np.transpose(sol)
 
 
-def halfPeriod(Ei,Ef,nu):
-    """ 
-    Compute the time of a half period
-        Ei : starting potential (V)
-        Ef : ending potential (V)
-        nu : scan rate (V/s)
+def calculate_concentration(C, t, D, Cini, E, E0, n, T, delta_t, delta_x):
     """
-    halfPeriod = np.abs((float(Ef)-float(Ei))/nu)
-    return halfPeriod
-         
+    Computes the concentration for the next time step based on the current concentration profile.
 
-def potential(Ei,Ef,nu,samplingt,nCycle):
-    """
-    Create the potential as a function of time
-        Ei : starting potential (V)
-        Ef : ending potential (V)
-        nu : scan rate (V/s)
-        sampling t : number of steps for a single forward scan (int)
-        nCycle : number of cycles, it should be a multiple of 0.5
-    """
-    halfPer = halfPeriod(Ei,Ef,nu)
-    t,deltat = np.linspace(0,halfPer,samplingt,endpoint=False,retstep=True)
-    #Creating the scan in the correcti direction depending on the staring and ending potential
-    if Ei<Ef:
-        Eforward = Ei + nu * t 
-        Ebackward = Ef - nu * t 
-    elif Ei>Ef:
-        Eforward = Ei - nu * t 
-        Ebackward = Ef + nu * t 
-    else:
-        print('The starting and ending potential are the same')
-    if nCycle % 0.5 != 0:
-        print('The number of cycles should be a multiple of 0.5')
-    Ecycle = [list(Eforward),list(Ebackward)]
-    Efull = []
-    for i in range(0,int(nCycle/0.5)):
-        Efull.extend(Ecycle[i%2])
-    #Adding the final point to make a full cycle ending either at Ei or Ef
-    if nCycle % 1 == 0:
-        Efull.append(Ei)
-    elif nCycle % 0.5 ==0.:
-        Efull.append(Ef)
-    return np.array( Efull )
+    Parameters:
+        C: np.ndarray
+            Array containing the concentration of species at all points and times.
+        t: int
+            Index of the current time step.
+        D: np.ndarray
+            Diffusion coefficients for the species.
+        Cini: np.ndarray
+            Initial concentration values.
+        E: np.ndarray
+            Array of voltages at each time step.
+        E0: float
+            Standard redox potential.
+        n: int
+            Number of electrons involved in the reaction.
+        T: float
+            Temperature in Kelvin.
+        delta_t: float
+            Time step size.
+        delta_x: float
+            Spatial step size.
 
-def animate(time,C,intensity,E,t,x,convertMoll):
+    Returns:
+        newC: np.ndarray
+            Updated concentration array for the next time step.
+    """
+    # Solve the diffusion equation
+    newC = solve_diffusion_equation(C, t, D, delta_t, delta_x)
+
+    # Apply the boundary conditions
+    newC[0] = apply_boundary_conditions(C, t, D, E, E0, n, T)
+
+    return newC
+
+
+def animate(time, C, intensity, E, t, x):
     """
     Animate the concentrations and dots on the corresponding graphs
     """
-    Cox.set_data(x, C[:,time,1]/convertMoll)
-    Cred.set_data(x, C[:,time,0]/convertMoll)
-    Et.set_data(t[time],Efull[time] )
-    it.set_data(t[time], intensity[time])
-    iE.set_data(E[time], intensity[time])
-    #ax2.set_ylim(np.min([-1,np.min(lapC[:,time])*1.05]),0.)
-    
-    return [Cox,Cred,Et,it,iE]
+    Cox.set_data(x, C[:, time, 1] / MOL_CONVERSION)
+    Cred.set_data(x, C[:, time, 0] / MOL_CONVERSION)
+    Et.set_data([t[time]], [Efull[time]])
+    it.set_data([t[time]], [intensity[time]])
+    iE.set_data([E[time]], [intensity[time]])
+    # ax2.set_ylim(np.min([-1,np.min(lapC[:,time])*1.05]),0.)
 
-     
-#Main programm 
+    return [Cox, Cred, Et, it, iE]
+
+
 if __name__ == "__main__":
-    #Input parameters
-    parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument("-Ei", "--initialPotential", type=float, default = 0., help="Initial potential in Volt",dest="Ei")
-    parser.add_argument("-Ef", "--sweepPotential"  , type=float, default = 1.5, help="Other end of the potential ramp in Volt",dest="Ef")
-    parser.add_argument("-E0", "--couplePotential"  , type=float, default = 0.77, help="Redox potential of the couple vs ESH",dest="E0")
-    parser.add_argument("-n", "--nbElectrons"  , type=int, default = 1, help="Number of electrons exchanged during the oxydo reduction process",dest="n")
-    parser.add_argument("-nu", "--sweepRate"  , type=float, default = 50.e-3, help="sweep rate in V/s",dest="nu")
-    parser.add_argument("-D_ox", "--DiffusionCoefficientOxidant"  , type=float, default = 6.04e-10, help="Diffusion coefficient of the oxydant in m^2/s",dest="D_ox")
-    parser.add_argument("-D_red", "--DiffusionCoefficientiReductor"  , type=float, default = 6.04e-10, help="Diffusion coefficient of the reductor in m^2/s",dest="D_red")
-    parser.add_argument("-C_ox", "--ConcentrationOxidant"  , type=float, default = 0.0, help="Concentration of the oxidant in mol/L",dest="C_ox")
-    parser.add_argument("-C_red", "--ConcentrationReductor"  , type=float, default = 0.05, help="Concentration of the reductor in mol/L",dest="C_red")
-    parser.add_argument("-A", "--Area"  , type=float, default = 1.e-4, help="Area of the electrode in m^2",dest="A")
-    parser.add_argument("-l", "--length"  , type=float, default = 5.e-4, help="Length of the simulation box",dest="l")
-    parser.add_argument("-nCycle", "--nbCycle"  , type=float, default = 1., help="number of cycles between Ei and Ef, it should be a multiple of 0.5",dest="nCycle")
-    parser.add_argument("-samplingx", "--samplingx"  , type=int, default = 100, help="Sampling of the simulation box",dest="samplingx")
-    parser.add_argument("-samplingt", "--samplingt"  , type=int, default = 10000, help="Sampling of a forward scan",dest="samplingt")
-    parser.add_argument("-T", "--Temperature"  , type=float, default = 298.15, help="Temperature in Kelvin",dest="T")
-    parser.add_argument("-csv", "--saveCsv"    , type=bool, default = True, help="save the i=f(E) curve as a csv file",dest="saveCsv")
-    parser.add_argument("-mp4", "--saveMovie"  , type=bool, default = False, help="save the animation as a mp4 file",dest="saveMovie")
-    parser.add_argument("-movie", "--movieName"    , type=str, default = 'voltammmetry.mp4', help="name of the voltammetry file",dest="movie")
-    parser.add_argument("-npy", "--saveNpy"    , type=bool, default = False, help="Save all the produced data as a numpy file, (i, V, t, x, C=f(x,t), the file produced can be really huge",dest="saveNpy")
-    args = parser.parse_args()
-    
-    #########################
-    #the program starts here
-    #########################
-    F = constants.physical_constants['Faraday constant'][0]
-    R = constants.R
-    convertMoll = 1000 #to convert mol/L to mol/m^3
-    #length of a forward scan
-    halfPer= halfPeriod(args.Ei,args.Ef,args.nu) 
-    #Creating the x values at which the concentration wil be computed each step.    
-    x,deltax = np.linspace(0,args.l,args.samplingx,retstep=True)
-    #Splitting the time to make it correspond to the defined sampling and number of cycles
-    sizet = int(args.samplingt*2*args.nCycle)+1
-    t,deltat = np.linspace(0,2*args.nCycle*halfPer,sizet,retstep=True)
-    #Creating the seesaw voltage    
-    Efull = potential(args.Ei,args.Ef,args.nu,args.samplingt,args.nCycle)
-    #Diffusion coefficients for all the species
-    D = np.array([args.D_red,args.D_ox])
-    Cini = convertMoll*np.array([args.C_red,args.C_ox])
-    C = np.zeros((args.samplingx,sizet,2)) 
-    #Initial condition for Cred(x,0) : C(x,0,0) = C_red 
-    C[:,0,0] = args.C_red* convertMoll * np.ones(args.samplingx)
-    #Initial condition for Cox(x,0) : C(x,0,1) = C_ox 
-    C[:,0,1] = args.C_ox* convertMoll * np.ones(args.samplingx)
+    Ei = 0.  # Initial potential in Volt
+    Ef = 1.5  # Other end of the potential ramp in Volt
+    E0 = 0.77  # Redox potential of the couple vs ESH
 
-    DM = np.minimum(args.D_ox,args.D_red)*deltat/(deltax**2 )
+    n = 1  # Number of electrons exchanged
+    nu = 50.e-3  # sweep rate in V/s
+
+    D_ox = 6.04e-10  # Diffusion coefficient of the oxydant in m^2/s
+    D_red = 6.04e-10  # Diffusion coefficient of the reductor in m^2/s
+
+    C_ox = 0.0  # Initial concentration of the oxydant at the electrode in mol/L
+    C_red = 0.05  # Initial concentration of the oxydant at the electrode in mol/L
+
+    A = 1.e-4  # Area of the electrode in m^2
+    l = 5.e-4  # Length of the simulation box
+
+    nCycle = 1.  # number of cycles between Ei and Ef, it should be a multiple of 0.5
+
+    sampling_t = 10000  # Sampling of a forward scan
+    sampling_x = 100  # Sampling of the simulation box
+
+    T = 298.15  # Temperature in Kelvin
+
+    half_period_duration = abs(Ef - Ei) / nu
+
+    # Creating the x values at which the concentration wil be computed each step.
+    x, delta_x = np.linspace(0, l, sampling_x, retstep=True)
+
+    # Splitting the time to make it correspond to the defined sampling and number of cycles
+    t, delta_t = np.linspace(0, 2 * half_period_duration * nCycle, (int(2 * sampling_t * nCycle) + 1), retstep=True)
+
+    # Creating the seesaw voltage
+    Efull = potential(Ei, Ef, nu, sampling_t, nCycle)
+
+    # Diffusion coefficients for all the species
+    D = np.array([D_red, D_ox])
+    Cini = MOL_CONVERSION * np.array([C_red, C_ox])
+
+    C = np.zeros((sampling_x, len(t), 2))
+    # Initial condition for Cred(x,0) : C(x,0,0) = C_red
+    C[:, 0, 0] = C_red * MOL_CONVERSION * np.ones(sampling_x)
+    # Initial condition for Cox(x,0) : C(x,0,1) = C_ox
+    C[:, 0, 1] = C_ox * MOL_CONVERSION * np.ones(sampling_x)
+
+    DM = np.minimum(D_ox, D_red) * delta_t / (delta_x ** 2)
     print('DM : {}'.format(DM))
     if DM > 0.5:
         print("the sampling is too scarce, choose more wisely : decrease t sampling or raise x sampling")
-    #Frame interval to have an animation roughly at 50 fps
-    frameselect = int(sizet/(50*t[-1]))
-    print('display every {} step, length(s) {}, sizet {} '.format(frameselect,t[-1], sizet))
-    print('D*T {} , length^2 {}'.format(np.max(D)*t[-1], args.l**2))
-    
 
-    #computation of the concentration at each position and time
-    for time in range(1,sizet):
-        C[:,time,:]=nextC(C,time,D,Cini,Efull,args.E0,args.n,args.T,deltat,deltax)
+    # Frame interval to have an animation roughly at 50 fps
+    frames_interval = int(len(t) / (50 * t[-1]))
+    print(
+        'Display every {} step, total length(s) {}, total simulation frames {} '.format(frames_interval, t[-1], len(t)))
+    print('D*T {} , length^2 {}'.format(np.max(D) * t[-1], l ** 2))
 
-    #Computation of the current from the concentration profiles
-    i = intensity(C,x,deltax,deltat,args.n,args.A,D)
-   
-    #Plotting of all the results
-    fig, axes = plt.subplots(2,2, figsize =(10,6))
-    #C=f(x)
-    ax1 = plt.subplot(2,2,1)
+    # Computation of the concentration at each position and time
+    for time in range(1, len(t)):
+        C[:, time, :] = calculate_concentration(C, time, D, Cini, Efull, E0, n, T, delta_t, delta_x)
+
+    # Computation of the current from the concentration profiles
+    i = calculate_intensity(n, A, D[0], C, delta_x)
+
+    # Plotting of all the results
+    fig, axes = plt.subplots(2, 2, figsize=(10, 6))
+
+    # C=f(x)
+    ax1 = plt.subplot(2, 2, 1)
     ax1.set_xlabel('Distance')
     ax1.set_ylabel('Concentration')
-    ax1.set_xlim(0.,args.l)
-    ax1.set_ylim(0.,args.C_red*1.05)
-    #i, E = ft(t)
-    ax2 = plt.subplot(2,2,2)
+    ax1.set_xlim(0., l)
+    ax1.set_ylim(0., C_red * 1.05)
+
+    # i, E = ft(t)
+    ax2 = plt.subplot(2, 2, 2)
     ax2.set_xlabel('time (s)')
     ax2.set_ylabel('intensity (A)')
-    ax2.plot(t,i,label = 'i',color='C0') 
-    ax2_2 = ax2.twinx() 
-    ax2_2.plot(t,Efull,label = 'E',color='C1') 
+    ax2.plot(t, i, label='i', color='C0')
+    ax2_2 = ax2.twinx()
+    ax2_2.plot(t, Efull, label='E', color='C1')
     ax2.legend(loc='upper left')
     ax2_2.legend(loc='upper right')
-    #i = f(E)
-    ax3 = plt.subplot(2,2,3)
+
+    # i = f(E)
+    ax3 = plt.subplot(2, 2, 3)
     ax3.set_xlabel('Voltage (V)')
     ax3.set_ylabel('intensity (A)')
-    ax3.plot(Efull,i,label = 'intensity',marker=None) 
-    #C(x=0) = f(t)
-    ax2_3 =plt.subplot(2,2,4)  
-    ax2_3.set_xlabel('time (m)')
-    ax2_3.set_ylabel('c at electrode')
-    ax2_3.plot(t,C[0,:,0]/convertMoll,label = 'red',color='C0') 
-    ax2_3.plot(t,C[0,:,1]/convertMoll,label = 'ox',color='C1') 
-    ax2_3.legend(loc='upper right')
-    #lines to animate
-    Cox, = ax1.plot([], [],color='C2' )
-    Cred, = ax1.plot([], [],color='C3' )
-    Et, = ax2_2.plot([], [] , marker='o',ms=2)
-    it, = ax2.plot([], [] , marker='o',ms=2)
-    iE, = ax3.plot([], [] , marker='o',ms=3,color='C0')
+    ax3.plot(Efull, i, label='intensity', marker=None)
+
+    # C(x=0) = f(t)
+    ax4 = plt.subplot(2, 2, 4)
+    ax4.set_xlabel('time (m)')
+    ax4.set_ylabel('c at electrode')
+    ax4.plot(t, C[0, :, 0] / MOL_CONVERSION, label='red', color='C0')
+    ax4.plot(t, C[0, :, 1] / MOL_CONVERSION, label='ox', color='C1')
+    ax4.legend(loc='upper right')
+
+    # lines to animate
+    Cox, = ax1.plot([], [], color='C2')
+    Cred, = ax1.plot([], [], color='C3')
+    Et, = ax2_2.plot([], [], marker='o', ms=2)
+    it, = ax2.plot([], [], marker='o', ms=2)
+    iE, = ax3.plot([], [], marker='o', ms=3, color='C0')
     plt.tight_layout()
-    #animate all the lines as a function of time
-    ani = animation.FuncAnimation(fig, animate, fargs =(C,i,Efull,t,x,convertMoll), blit=True , frames=range(0,sizet+1,frameselect),interval=20)#,save_count=int(sizet/frameselect))
-    #write the file as a mp4
-    writermp4 = animation.FFMpegWriter(fps=50) 
-    if args.saveMovie == True:
-        ani.save(args.movie, writer=writermp4)
-    filename ="voltammetry-r-sweep-{}-E0-{}-C_ox-{}-C_red-{}-args.Ei-{}-Ef-{}".format(args.nu,args.E0,args.C_ox,args.C_red,args.Ei,args.Ef) 
-    if args.saveCsv == True:
-        np.savetxt(filename+'.csv', np.transpose([Efull,i]), delimiter=",")
-    if args.saveNpy == True:
-        with open(filename+'.npy','wb') as fileOutput:
-            np.save(fileOutput, [Efull,i,t])
-            np.save(fileOutput, x)
-            np.save(fileOutput, C  )
+    # animate all the lines as a function of time
+    ani = animation.FuncAnimation(fig, animate, fargs=(C, i, Efull, t, x), blit=True,
+                                  frames=range(0, len(t) + 1, frames_interval), interval=20)
+
+    # ,save_count=int(sizet/frameselect))
+    # filename = "simulations-r-sweep-{}-E0-{}-C_ox-{}-C_red-{}-Ei-{}-Ef-{}".format(nu, E0, C_ox, C_red, Ei, Ef)
+    # save the animation as a mp4 file
+    # writermp4 = animation.FFMpegWriter(fps=50)
+    # ani.save(filename + '.mp4', writer=writermp4)
+    # # save the i=f(E) curve as a csv file
+    # np.savetxt(filename + '.csv', np.transpose([Efull, i]), delimiter=",")
+    # #  Save all the produced data as a numpy file, (i, V, t, x, C=f(x,t)
+    # with open(filename + '.npy', 'wb') as fileOutput:
+    #     np.save(fileOutput, [Efull, i, t])
+    #     np.save(fileOutput, x)
+    #     np.save(fileOutput, C)
+
     plt.show()
-    pass
