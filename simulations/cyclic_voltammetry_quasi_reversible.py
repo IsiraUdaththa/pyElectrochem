@@ -3,7 +3,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import scipy.constants as constants
 
-from voltammetry import calculate_intensity, potential, solve_diffusion_equation
+from cyclic_voltammetry_reversible import calculate_intensity, potential, solve_diffusion_equation
 
 F = constants.physical_constants['Faraday constant'][0]  # Faraday constant, 96485 C/mol
 R = constants.R  # Gas constant, 8.314 J/(mol·K)
